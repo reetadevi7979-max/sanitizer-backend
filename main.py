@@ -50,8 +50,9 @@ async def sanitize_text(payload: SanitizeRequest):
         raise HTTPException(status_code=400, detail="Text cannot be empty.")
 
     try:
+        # Changed to llama-3.1-8b-instant (Fast, stable, and active on Groq)
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="llama-3.1-8b-instant",
             temperature=0.7,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
