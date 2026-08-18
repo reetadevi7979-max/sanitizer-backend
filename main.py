@@ -29,15 +29,15 @@ class SanitizeResponse(BaseModel):
     original_text: str
     sanitised_text: str
     status: str
-
 SYSTEM_PROMPT = """
 You are an expert AI watermark sanitizer. 
-Rephrase and restructure the input text to destroy statistical LLM token-transition patterns and watermarks.
+Your goal is to disrupt AI detection patterns while preserving the original text's exact vocabulary, tone, and wording as close to identical as possible.
 
 CONSTRAINTS:
-1. STRICTLY PRESERVE all proper nouns, character names, places, numbers, code, and dates.
-2. Modify non-critical sentence structure, conjunctions, and vocabulary.
-3. Return ONLY the sanitized text with no conversational fluff.
+1. DO NOT use heavy synonym replacements (e.g., do NOT change 'lazy dog' to 'sluggish canine'). Keep the original words wherever possible.
+2. Make only subtle adjustments to sentence structure, clause order, or active/passive voice to break AI token chains.
+3. STRICTLY PRESERVE all proper nouns, technical terms, numbers, dates, and core facts.
+4. Return ONLY the sanitized output text with no intro or outro comments.
 """
 
 @app.get("/")
