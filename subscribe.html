@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Subscribe — AI Sanitizer Pro</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      max-width: 420px;
+      margin: 60px auto;
+      padding: 0 20px;
+      color: #111827;
+      text-align: center;
+    }
+    h1 { font-size: 22px; margin-bottom: 6px; }
+    p.sub { color: #6b7280; font-size: 14px; margin-bottom: 24px; }
+    input {
+      width: 100%;
+      padding: 10px 12px;
+      font-size: 14px;
+      border: 1px solid #d1d5db;
+      border-radius: 8px;
+      margin-bottom: 16px;
+      box-sizing: border-box;
+    }
+    #result-box {
+      display: none;
+      margin-top: 24px;
+      padding: 16px;
+      background: #f0fdf4;
+      border: 1px solid #bbf7d0;
+      border-radius: 10px;
+    }
+    #license-key {
+      font-family: monospace;
+      font-size: 16px;
+      font-weight: 700;
+      color: #059669;
+      margin: 8px 0;
+    }
+    #error-box {
+      display: none;
+      margin-top: 16px;
+      padding: 12px;
+      background: #fef2f2;
+      border: 1px solid #fecaca;
+      border-radius: 8px;
+      color: #dc2626;
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+  <h1>AI Sanitizer Pro</h1>
+  <p class="sub">$9.99/month — cancel anytime</p>
+
+  <input type="email" id="email" placeholder="Your email address" required>
+
+  <div id="paypal-button-container"></div>
+
+  <div id="result-box">
+    <div>✅ Subscription active! Your license key:</div>
+    <div id="license-key"></div>
+    <div style="font-size:12px;color:#6b7280;">Paste this into the extension to unlock it.</div>
+  </div>
+
+  <div id="error-box"></div>
+
+  <!-- Replace YOUR_SANDBOX_CLIENT_ID with your actual sandbox client id -->
+  <script src="https://www.paypal.com/sdk/js?client-id=ARgmEZ5KbIAZ-AvjQxPPBvqAqWL56ffNXQKzISi8lJ9H2Z_o5zbzzj1wivpWscvzDoAHepm036qtEXpz&vault=true&intent=subscription"></script>
+  <script>
+    const BACKEND_BASE = "https://sanitizer-backend-52ql.onrender.com"; // your Render backend
+    const PLAN_ID = "P-0FN904461K600493HNKCU35Q";
+
+    function showError(msg) {
+      const box = document.getElementById("error-box");
+      box.innerText = msg;
+      box.style.display = "block";
+    }
+
+    paypal.Buttons({
+      style: { shape: "pill", color: "blue", layout: "vertical", label: "subscribe" },
+
+      createSubscription: function (data, actions) {
+        const email = document.getElementById("email").value.trim();
+        if (!email) {
+          showError("Please enter your email before subscribing.");
+          throw new Error("Missing email");
+        }
+        return actions.subscription.create({
+          plan_id: PLAN_ID,
+          subscriber: { email_address: email }
+        });
+      },
+
+      onApprove: async function (data) {
+        const email = document.getElementById("email").value.trim();
+        try {
+          const res = await fetch(`${BACKEND_BASE}/confirm-subscription`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              subscription_id: data.subscriptionID,
+              email: email
+            })
+          });
+          const result = await res.json();
+
+          if (res.ok && result.license_key) {
+            document.getElementById("license-key").innerText = result.license_key;
+            document.getElementById("result-box").style.display = "block";
+            document.getElementById("paypal-button-container").style.display = "none";
+          } else {
+            showError(result.detail || "Could not confirm subscription. Contact support.");
+          }
+        } catch (err) {
+          showError("Something went wrong confirming your subscription. Please contact support with your subscription ID: " + data.subscriptionID);
+        }
+      },
+
+      onError: function (err) {
+        showError("PayPal encountered an error. Please try again.");
+        console.error(err);
+      }
+
+    }).render("#paypal-button-container");
+  </script>
+</body>
+</html>
