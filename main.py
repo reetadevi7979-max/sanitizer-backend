@@ -1,15 +1,17 @@
 import os
-import uuid
+import random
+import datetime
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
+import resend
 from openai import OpenAI
 from supabase import create_client, Client
 
 app = FastAPI(title="AI Watermark Sanitizer API")
 
-# Enable CORS for browser extension and checkout page
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,32 +24,35 @@ app.add_middleware(
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 EXTENSION_SECRET = os.environ.get("EXTENSION_SECRET")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
-# Accepts both SUPABASE_SERVICE_KEY or SUPABASE_KEY from Render
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY") or os.environ.get("SUPABASE_KEY")
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
 
-# Initialize OpenAI Client for Groq
+if RESEND_API_KEY:
+    resend.api_key = RESEND_API_KEY
+
 client = OpenAI(
     base_url="https://api.groq.com/openai/v1",
     api_key=GROQ_API_KEY or "placeholder"
 )
 
-# Initialize Supabase Client
 supabase: Optional[Client] = (
     create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
 )
 
-# Request / Response Schemas
+# Request Models
 class SanitizeRequest(BaseModel):
     text: str
-
-class SanitizeResponse(BaseModel):
-    original_text: str
-    sanitised_text: str
-    status: str
 
 class ConfirmSubscriptionRequest(BaseModel):
     subscription_id: str
     email: str
+
+class RequestOTPRequest(BaseModel):
+    email: str
+
+class VerifyOTPRequest(BaseModel):
+    email: str
+    otp: str
 
 SYSTEM_PROMPT = """
 You are an expert AI watermark sanitizer. 
@@ -64,57 +69,103 @@ CONSTRAINTS:
 def health_check():
     return {"status": "online", "message": "Sanitizer backend running."}
 
+@app.get("/subscribe", response_class=FileResponse)
+async def serve_subscribe_page():
+    return FileResponse("subscribe.html")
+
 @app.post("/confirm-subscription")
 async def confirm_subscription(payload: ConfirmSubscriptionRequest):
-    """Called by subscribe.html after PayPal checkout completes."""
     if not supabase:
-        raise HTTPException(status_code=500, detail="Supabase client not configured. Check SUPABASE_URL and SUPABASE_SERVICE_KEY.")
+        raise HTTPException(status_code=500, detail="Supabase not configured.")
+    
+    email = payload.email.lower().strip()
+    
+    # Save or update subscriber status to active
+    supabase.table("subscribers").upsert({
+        "email": email,
+        "subscription_id": payload.subscription_id,
+        "status": "active"
+    }, on_conflict="email").execute()
 
-    if not payload.subscription_id or not payload.email:
-        raise HTTPException(status_code=400, detail="Missing subscription_id or email.")
+    return {"status": "success", "message": "Subscription confirmed."}
 
-    # Generate a unique license key (e.g., SAN-A1B2-C3D4)
-    license_key = f"SAN-{uuid.uuid4().hex[:4].upper()}-{uuid.uuid4().hex[:4].upper()}"
+@app.post("/auth/request-otp")
+async def request_otp(payload: RequestOTPRequest):
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Database error.")
+    
+    email = payload.email.lower().strip()
+    
+    # Check if subscriber is active
+    res = supabase.table("subscribers").select("status").eq("email", email).execute()
+    if not res.data or res.data[0].get("status") != "active":
+        raise HTTPException(status_code=403, detail="No active subscription found for this email.")
 
-    try:
-        # Save subscriber record to Supabase
-        res = supabase.table("subscribers").insert({
-            "email": payload.email,
-            "subscription_id": payload.subscription_id,
-            "license_key": license_key,
-            "status": "active"
-        }).execute()
+    # Generate 6-digit OTP code
+    otp_code = f"{random.randint(100000, 999999)}"
+    
+    # Store OTP in Supabase with expiration (10 minutes)
+    supabase.table("subscribers").update({
+        "otp_code": otp_code,
+        "otp_created_at": datetime.datetime.utcnow().isoformat()
+    }).eq("email", email).execute()
 
-        return {"status": "success", "license_key": license_key}
+    # Send OTP Email
+    if RESEND_API_KEY:
+        resend.Emails.send({
+            "from": "AI Sanitizer <onboarding@resend.dev>",
+            "to": email,
+            "subject": "Your AI Sanitizer Login Code",
+            "html": f"""
+                <h2>AI Sanitizer Login</h2>
+                <p>Your 6-digit verification code is:</p>
+                <h1 style="color:#2563eb; letter-spacing: 4px; font-size:32px;">{otp_code}</h1>
+                <p>This code will expire in 10 minutes.</p>
+            """
+        })
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+    return {"status": "success", "message": "Verification code sent to your email."}
 
-@app.post("/sanitize", response_model=SanitizeResponse)
+@app.post("/auth/verify-otp")
+async def verify_otp(payload: VerifyOTPRequest):
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Database error.")
+    
+    email = payload.email.lower().strip()
+    
+    res = supabase.table("subscribers").select("otp_code, status").eq("email", email).execute()
+    if not res.data or res.data[0].get("status") != "active":
+        raise HTTPException(status_code=403, detail="No active subscription.")
+
+    stored_otp = res.data[0].get("otp_code")
+    if not stored_otp or stored_otp != payload.otp.strip():
+        raise HTTPException(status_code=400, detail="Invalid verification code.")
+
+    # Clear OTP after successful login
+    supabase.table("subscribers").update({"otp_code": None}).eq("email", email).execute()
+
+    return {"status": "success", "email": email}
+
+@app.post("/sanitize")
 async def sanitize_text(
     payload: SanitizeRequest,
     x_extension_key: Optional[str] = Header(None, alias="x-extension-key"),
-    x_license_key: Optional[str] = Header(None, alias="x-license-key")
+    x_user_email: Optional[str] = Header(None, alias="x-user-email")
 ):
-    # 1. Extension Secret Verification
     if EXTENSION_SECRET and x_extension_key != EXTENSION_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized extension request.")
 
-    # 2. License Key Verification against Supabase (if provided)
-    if x_license_key and supabase:
-        sub_check = supabase.table("subscribers")\
-            .select("status")\
-            .eq("license_key", x_license_key)\
-            .execute()
+    if not x_user_email or not supabase:
+        raise HTTPException(status_code=401, detail="Please sign in to use AI Sanitizer.")
 
-        if not sub_check.data or sub_check.data[0].get("status") != "active":
-            raise HTTPException(status_code=403, detail="Invalid or expired license key.")
+    # Verify subscription status on every request
+    res = supabase.table("subscribers").select("status").eq("email", x_user_email.lower().strip()).execute()
+    if not res.data or res.data[0].get("status") != "active":
+        raise HTTPException(status_code=403, detail="Active subscription required.")
 
-    # 3. Input Validation
     if not payload.text or len(payload.text.strip()) == 0:
         raise HTTPException(status_code=400, detail="Text cannot be empty.")
 
-    # 4. Groq Model Execution
     try:
         response = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
@@ -124,11 +175,10 @@ async def sanitize_text(
                 {"role": "user", "content": payload.text}
             ]
         )
-        
-        return SanitizeResponse(
-            original_text=payload.text,
-            sanitised_text=response.choices[0].message.content.strip(),
-            status="success"
-        )
+        return {
+            "original_text": payload.text,
+            "sanitised_text": response.choices[0].message.content.strip(),
+            "status": "success"
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
