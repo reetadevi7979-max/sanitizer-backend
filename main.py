@@ -15,43 +15,37 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize Groq Client
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-
-groq_client = None
-if GROQ_API_KEY:
-    groq_client = OpenAI(
-        base_url="https://api.groq.com/openai/v1",
-        api_key=GROQ_API_KEY
-    )
-
-
 class SanitizeRequest(BaseModel):
     text: str
 
-
 @app.get("/")
 async def root():
-    return {"status": "online", "message": "AI Watermark Sanitizer API is operational."}
-
+    return {"status": "online", "message": "API is operational."}
 
 @app.post("/sanitize")
 async def sanitize_text(data: SanitizeRequest):
-    if not GROQ_API_KEY or not groq_client:
+    groq_key = os.getenv("GROQ_API_KEY")
+    
+    if not groq_key:
         raise HTTPException(
             status_code=500, 
-            detail="GROQ_API_KEY is not set in environment variables."
+            detail="GROQ_API_KEY environment variable is missing on Render."
         )
 
-    prompt = (
-        "You are an expert editor specializing in removing AI watermarks, repetitive phrasing, "
-        "and telltale structural patterns (such as unnatural transitions, passive overuse, and buzzwords). "
-        "Rewrite the following text so it sounds completely human, polished, and natural while maintaining "
-        "the original meaning:\n\n"
-        f"{data.text}"
-    )
-
     try:
+        groq_client = OpenAI(
+            base_url="https://api.groq.com/openai/v1",
+            api_key=groq_key.strip()
+        )
+
+        prompt = (
+            "You are an expert editor specializing in removing AI watermarks, repetitive phrasing, "
+            "and telltale structural patterns (such as unnatural transitions, passive overuse, and buzzwords). "
+            "Rewrite the following text so it sounds completely human, polished, and natural while maintaining "
+            "the original meaning:\n\n"
+            f"{data.text}"
+        )
+
         response = groq_client.chat.completions.create(
             model="llama-3.1-8b-instant",
             messages=[
@@ -60,10 +54,15 @@ async def sanitize_text(data: SanitizeRequest):
             ],
             temperature=0.7,
         )
-        sanitized = response.choices[0].message.content
-        return {"status": "success", "sanitized_text": sanitized}
+
+        return {
+            "status": "success", 
+            "sanitized_text": response.choices[0].message.content
+        }
+
     except Exception as e:
+        # Passes the exact Groq error back to RapidAPI response
         raise HTTPException(
             status_code=500, 
-            detail=f"Groq Execution Error: {str(e)}"
+            detail=f"GROQ FAILURE: {type(e).__name__} - {str(e)}"
         )
