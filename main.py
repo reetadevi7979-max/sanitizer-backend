@@ -12,6 +12,7 @@ from supabase import create_client, Client
 
 app = FastAPI(title="AI Watermark Sanitizer API")
 
+# Setup CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,165 +21,190 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Environment Variables
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-EXTENSION_SECRET = os.environ.get("EXTENSION_SECRET")
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY") or os.environ.get("SUPABASE_KEY")
-RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
+# Initialize Supabase
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_KEY")
 
-if RESEND_API_KEY:
-    resend.api_key = RESEND_API_KEY
+supabase: Optional[Client] = None
+if SUPABASE_URL and SUPABASE_SERVICE_KEY:
+    supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
-client = OpenAI(
-    base_url="https://api.groq.com/openai/v1",
-    api_key=GROQ_API_KEY or "placeholder"
-)
+# Initialize Resend & Groq
+resend.api_key = os.getenv("RESEND_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-supabase: Optional[Client] = (
-    create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
-)
+groq_client = None
+if GROQ_API_KEY:
+    groq_client = OpenAI(
+        base_url="https://api.groq.com/openai/v1",
+        api_key=GROQ_API_KEY
+    )
 
-# Request Models
-class SanitizeRequest(BaseModel):
-    text: str
+# In-memory store for OTPs (For production scaling, consider storing in Supabase)
+otp_store = {}
 
-class ConfirmSubscriptionRequest(BaseModel):
-    subscription_id: str
-    email: str
 
-class RequestOTPRequest(BaseModel):
+# --- Request Models ---
+
+class OTPRequest(BaseModel):
     email: str
 
 class VerifyOTPRequest(BaseModel):
     email: str
     otp: str
 
-SYSTEM_PROMPT = """
-You are an expert AI watermark sanitizer. 
-Your goal is to disrupt AI detection patterns while preserving the original text's exact vocabulary, tone, and wording as close to identical as possible.
+class SanitizeRequest(BaseModel):
+    text: str
 
-CONSTRAINTS:
-1. DO NOT use heavy synonym replacements. Keep the original words wherever possible.
-2. Make only subtle adjustments to sentence structure, clause order, or active/passive voice to break AI token chains.
-3. STRICTLY PRESERVE all proper nouns, technical terms, numbers, dates, and core facts.
-4. Return ONLY the sanitized output text with no intro or outro comments.
-"""
+class SubscriptionRequest(BaseModel):
+    email: str
+    subscription_id: Optional[str] = None
 
-@app.get("/")
-def health_check():
-    return {"status": "online", "message": "Sanitizer backend running."}
 
-@app.get("/subscribe", response_class=FileResponse)
+# --- Static Routes ---
+
+@app.get("/subscribe")
 async def serve_subscribe_page():
-    return FileResponse("subscribe.html")
+    file_path = os.path.join(os.path.dirname(__file__), "subscribe.html")
+    if not os.path.exists(file_path):
+        raise HTTPException(
+            status_code=404, 
+            detail="subscribe.html not found in project root directory."
+        )
+    return FileResponse(file_path, media_type="text/html")
 
-@app.post("/confirm-subscription")
-async def confirm_subscription(payload: ConfirmSubscriptionRequest):
+
+# --- Auth Routes ---
+
+@app.post("/send-otp")
+async def send_otp(data: OTPRequest):
+    email = data.email.lower().strip()
+
     if not supabase:
-        raise HTTPException(status_code=500, detail="Supabase not configured.")
-    
-    email = payload.email.lower().strip()
-    
-    # Save or update subscriber status to active
-    supabase.table("subscribers").upsert({
-        "email": email,
-        "subscription_id": payload.subscription_id,
-        "status": "active"
-    }, on_conflict="email").execute()
+        raise HTTPException(status_code=500, detail="Database client not configured.")
 
-    return {"status": "success", "message": "Subscription confirmed."}
+    # Check subscriber status in Supabase
+    try:
+        response = supabase.table("subscribers").select("*").eq("email", email).execute()
+        if not response.data or response.data[0].get("status") != "active":
+            raise HTTPException(
+                status_code=403, 
+                detail="No active subscription found for this email."
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-@app.post("/auth/request-otp")
-async def request_otp(payload: RequestOTPRequest):
-    if not supabase:
-        raise HTTPException(status_code=500, detail="Database error.")
-    
-    email = payload.email.lower().strip()
-    
-    # Check if subscriber is active
-    res = supabase.table("subscribers").select("status").eq("email", email).execute()
-    if not res.data or res.data[0].get("status") != "active":
-        raise HTTPException(status_code=403, detail="No active subscription found for this email.")
+    # Generate 6-digit OTP
+    otp = str(random.randint(100000, 999999))
+    otp_store[email] = {
+        "otp": otp,
+        "expires_at": datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=10)
+    }
 
-    # Generate 6-digit OTP code
-    otp_code = f"{random.randint(100000, 999999)}"
-    
-    # Store OTP in Supabase with expiration (10 minutes)
-    supabase.table("subscribers").update({
-        "otp_code": otp_code,
-        "otp_created_at": datetime.datetime.utcnow().isoformat()
-    }).eq("email", email).execute()
-
-    # Send OTP Email
-    if RESEND_API_KEY:
+    # Send OTP via Resend
+    try:
         resend.Emails.send({
             "from": "AI Sanitizer <onboarding@resend.dev>",
             "to": email,
-            "subject": "Your AI Sanitizer Login Code",
-            "html": f"""
-                <h2>AI Sanitizer Login</h2>
-                <p>Your 6-digit verification code is:</p>
-                <h1 style="color:#2563eb; letter-spacing: 4px; font-size:32px;">{otp_code}</h1>
-                <p>This code will expire in 10 minutes.</p>
-            """
+            "subject": "Your AI Sanitizer Verification Code",
+            "html": f"<p>Your 6-digit login code is: <strong>{otp}</strong>. It expires in 10 minutes.</p>"
         })
+        return {"status": "success", "message": "OTP sent successfully."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to send email: {str(e)}")
 
-    return {"status": "success", "message": "Verification code sent to your email."}
 
-@app.post("/auth/verify-otp")
-async def verify_otp(payload: VerifyOTPRequest):
-    if not supabase:
-        raise HTTPException(status_code=500, detail="Database error.")
-    
-    email = payload.email.lower().strip()
-    
-    res = supabase.table("subscribers").select("otp_code, status").eq("email", email).execute()
-    if not res.data or res.data[0].get("status") != "active":
-        raise HTTPException(status_code=403, detail="No active subscription.")
+@app.post("/verify-otp")
+async def verify_otp(data: VerifyOTPRequest):
+    email = data.email.lower().strip()
+    user_otp = data.otp.strip()
 
-    stored_otp = res.data[0].get("otp_code")
-    if not stored_otp or stored_otp != payload.otp.strip():
-        raise HTTPException(status_code=400, detail="Invalid verification code.")
+    record = otp_store.get(email)
+    if not record:
+        raise HTTPException(status_code=400, detail="No OTP code requested for this email.")
+
+    if datetime.datetime.now(datetime.timezone.utc) > record["expires_at"]:
+        del otp_store[email]
+        raise HTTPException(status_code=400, detail="OTP code has expired.")
+
+    if record["otp"] != user_otp:
+        raise HTTPException(status_code=400, detail="Invalid OTP code.")
 
     # Clear OTP after successful login
-    supabase.table("subscribers").update({"otp_code": None}).eq("email", email).execute()
+    del otp_store[email]
+    return {"status": "success", "message": "Authentication successful.", "email": email}
 
-    return {"status": "success", "email": email}
 
-@app.post("/sanitize")
-async def sanitize_text(
-    payload: SanitizeRequest,
-    x_extension_key: Optional[str] = Header(None, alias="x-extension-key"),
-    x_user_email: Optional[str] = Header(None, alias="x-user-email")
-):
-    if EXTENSION_SECRET and x_extension_key != EXTENSION_SECRET:
-        raise HTTPException(status_code=401, detail="Unauthorized extension request.")
+# --- Payment & Webhook Routes ---
 
-    if not x_user_email or not supabase:
-        raise HTTPException(status_code=401, detail="Please sign in to use AI Sanitizer.")
+@app.post("/confirm-subscription")
+async def confirm_subscription(data: SubscriptionRequest):
+    email = data.email.lower().strip()
+    subscription_id = data.subscription_id
 
-    # Verify subscription status on every request
-    res = supabase.table("subscribers").select("status").eq("email", x_user_email.lower().strip()).execute()
-    if not res.data or res.data[0].get("status") != "active":
-        raise HTTPException(status_code=403, detail="Active subscription required.")
-
-    if not payload.text or len(payload.text.strip()) == 0:
-        raise HTTPException(status_code=400, detail="Text cannot be empty.")
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase not configured.")
 
     try:
-        response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            temperature=0.7,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": payload.text}
-            ]
-        )
-        return {
-            "original_text": payload.text,
-            "sanitised_text": response.choices[0].message.content.strip(),
-            "status": "success"
+        payload = {
+            "email": email,
+            "status": "active"
         }
+        if subscription_id:
+            payload["subscription_id"] = subscription_id
+
+        # Upsert subscriber into Supabase
+        supabase.table("subscribers").upsert(
+            payload, 
+            on_conflict="email"
+        ).execute()
+
+        return {"status": "success", "message": "Subscription confirmed!"}
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Supabase Insert Error: {str(e)}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Database execution error: {str(e)}"
+        )
+
+
+# --- Core Extension Sanitization Route ---
+
+@app.post("/sanitize")
+async def sanitize_text(data: SanitizeRequest, x_user_email: Optional[str] = Header(None)):
+    if not x_user_email:
+        raise HTTPException(status_code=401, detail="Missing user email header.")
+
+    if not groq_client:
+        raise HTTPException(status_code=500, detail="Groq API not configured on server.")
+
+    # Optional: Verify active subscription status on every API call
+    if supabase:
+        res = supabase.table("subscribers").select("status").eq("email", x_user_email.lower().strip()).execute()
+        if not res.data or res.data[0].get("status") != "active":
+            raise HTTPException(status_code=403, detail="Active subscription required.")
+
+    prompt = (
+        "You are an expert editor specializing in removing AI watermarks, repetitive phrasing, "
+        "and telltale structural patterns (such as unnatural transitions, passive overuse, and buzzwords). "
+        "Rewrite the following text so it sounds completely human, polished, and natural while maintaining "
+        "the original meaning:\n\n"
+        f"{data.text}"
+    )
+
+    try:
+        response = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": "You sanitize text to sound strictly human and remove AI watermarks."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+        )
+        sanitized = response.choices[0].message.content
+        return {"status": "success", "sanitized_text": sanitized}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Sanitization error: {str(e)}")
