@@ -40,7 +40,7 @@ if GROQ_API_KEY:
         api_key=GROQ_API_KEY
     )
 
-# In-memory store for OTPs (For production scaling, consider storing in Supabase)
+# In-memory store for OTPs
 otp_store = {}
 
 
@@ -83,7 +83,6 @@ async def send_otp(data: OTPRequest):
     if not supabase:
         raise HTTPException(status_code=500, detail="Database client not configured.")
 
-    # Check subscriber status in Supabase
     try:
         response = supabase.table("subscribers").select("*").eq("email", email).execute()
         if not response.data or response.data[0].get("status") != "active":
@@ -96,14 +95,12 @@ async def send_otp(data: OTPRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-    # Generate 6-digit OTP
     otp = str(random.randint(100000, 999999))
     otp_store[email] = {
         "otp": otp,
         "expires_at": datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=10)
     }
 
-    # Send OTP via Resend
     try:
         resend.Emails.send({
             "from": "AI Sanitizer <onboarding@resend.dev>",
@@ -132,12 +129,11 @@ async def verify_otp(data: VerifyOTPRequest):
     if record["otp"] != user_otp:
         raise HTTPException(status_code=400, detail="Invalid OTP code.")
 
-    # Clear OTP after successful login
     del otp_store[email]
     return {"status": "success", "message": "Authentication successful.", "email": email}
 
 
-# --- Payment & Webhook Routes ---
+# --- Payment Routes ---
 
 @app.post("/confirm-subscription")
 async def confirm_subscription(data: SubscriptionRequest):
@@ -155,7 +151,6 @@ async def confirm_subscription(data: SubscriptionRequest):
         if subscription_id:
             payload["subscription_id"] = subscription_id
 
-        # Upsert subscriber into Supabase
         supabase.table("subscribers").upsert(
             payload, 
             on_conflict="email"
@@ -171,18 +166,15 @@ async def confirm_subscription(data: SubscriptionRequest):
         )
 
 
-# --- Core Extension Sanitization Route ---
+# --- Core Sanitization Route ---
 
 @app.post("/sanitize")
 async def sanitize_text(data: SanitizeRequest, x_user_email: Optional[str] = Header(None)):
-    if not x_user_email:
-        raise HTTPException(status_code=401, detail="Missing user email header.")
-
     if not groq_client:
         raise HTTPException(status_code=500, detail="Groq API not configured on server.")
 
-    # Optional: Verify active subscription status on every API call
-    if supabase:
+    # Only validate Supabase subscription if an email header is explicitly passed (e.g., from extension)
+    if x_user_email and supabase:
         res = supabase.table("subscribers").select("status").eq("email", x_user_email.lower().strip()).execute()
         if not res.data or res.data[0].get("status") != "active":
             raise HTTPException(status_code=403, detail="Active subscription required.")
