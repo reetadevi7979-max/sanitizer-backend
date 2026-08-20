@@ -188,15 +188,13 @@ async def sanitize_text(data: SanitizeRequest, x_user_email: Optional[str] = Hea
     )
 
     try:
-        response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": "You sanitize text to sound strictly human and remove AI watermarks."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.7,
-        )
-        sanitized = response.choices[0].message.content
-        return {"status": "success", "sanitized_text": sanitized}
-    except Exception as e:
+       # Change this line inside @app.post("/sanitize")
+response = groq_client.chat.completions.create(
+    model="llama-3.1-8b-instant",  # Updated to active Groq production model
+    messages=[
+        {"role": "system", "content": "You sanitize text to sound strictly human and remove AI watermarks."},
+        {"role": "user", "content": prompt}
+    ],
+    temperature=0.7,
+)
         raise HTTPException(status_code=500, detail=f"Sanitization error: {str(e)}")
