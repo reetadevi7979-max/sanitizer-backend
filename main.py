@@ -173,7 +173,7 @@ async def sanitize_text(data: SanitizeRequest, x_user_email: Optional[str] = Hea
     if not groq_client:
         raise HTTPException(status_code=500, detail="Groq API not configured on server.")
 
-    # Only validate Supabase subscription if an email header is explicitly passed (e.g., from extension)
+    # Validate Supabase subscription only if an email header is explicitly passed (e.g., from chrome extension)
     if x_user_email and supabase:
         res = supabase.table("subscribers").select("status").eq("email", x_user_email.lower().strip()).execute()
         if not res.data or res.data[0].get("status") != "active":
@@ -188,13 +188,15 @@ async def sanitize_text(data: SanitizeRequest, x_user_email: Optional[str] = Hea
     )
 
     try:
-       # Change this line inside @app.post("/sanitize")
-response = groq_client.chat.completions.create(
-    model="llama-3.1-8b-instant",  # Updated to active Groq production model
-    messages=[
-        {"role": "system", "content": "You sanitize text to sound strictly human and remove AI watermarks."},
-        {"role": "user", "content": prompt}
-    ],
-    temperature=0.7,
-)
+        response = groq_client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[
+                {"role": "system", "content": "You sanitize text to sound strictly human and remove AI watermarks."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+        )
+        sanitized = response.choices[0].message.content
+        return {"status": "success", "sanitized_text": sanitized}
+    except Exception as e:
         raise HTTPException(status_code=500, detail=f"Sanitization error: {str(e)}")
