@@ -6,7 +6,7 @@ from openai import OpenAI
 
 app = FastAPI(title="AI Watermark Sanitizer API")
 
-# Setup CORS
+# Enable CORS for browser extensions and external clients
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -15,54 +15,54 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+
+client = OpenAI(
+    base_url="https://api.groq.com/openai/v1",
+    api_key=GROQ_API_KEY or "placeholder"
+)
+
 class SanitizeRequest(BaseModel):
     text: str
 
-@app.get("/")
-async def root():
-    return {"status": "online", "message": "API is operational."}
+class SanitizeResponse(BaseModel):
+    original_text: str
+    sanitised_text: str
+    status: str
 
-@app.post("/sanitize")
-async def sanitize_text(data: SanitizeRequest):
-    groq_key = os.getenv("GROQ_API_KEY")
-    
-    if not groq_key:
-        raise HTTPException(
-            status_code=500, 
-            detail="GROQ_API_KEY environment variable is missing on Render."
-        )
+SYSTEM_PROMPT = """
+You are an expert AI watermark sanitizer. 
+Rephrase and restructure the input text to destroy statistical LLM token-transition patterns and watermarks.
+
+CONSTRAINTS:
+1. STRICTLY PRESERVE all proper nouns, character names, places, numbers, code, and dates.
+2. Modify non-critical sentence structure, conjunctions, and vocabulary.
+3. Return ONLY the sanitized text with no conversational fluff.
+"""
+
+@app.get("/")
+def health_check():
+    return {"status": "online", "message": "Sanitizer backend running."}
+
+@app.post("/sanitize", response_model=SanitizeResponse)
+async def sanitize_text(payload: SanitizeRequest):
+    if not payload.text or len(payload.text.strip()) == 0:
+        raise HTTPException(status_code=400, detail="Text cannot be empty.")
 
     try:
-        groq_client = OpenAI(
-            base_url="https://api.groq.com/openai/v1",
-            api_key=groq_key.strip()
-        )
-
-        prompt = (
-            "You are an expert editor specializing in removing AI watermarks, repetitive phrasing, "
-            "and telltale structural patterns (such as unnatural transitions, passive overuse, and buzzwords). "
-            "Rewrite the following text so it sounds completely human, polished, and natural while maintaining "
-            "the original meaning:\n\n"
-            f"{data.text}"
-        )
-
-        response = groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[
-                {"role": "system", "content": "You sanitize text to sound strictly human and remove AI watermarks."},
-                {"role": "user", "content": prompt}
-            ],
+        response = client.chat.completions.create(
+            model="openai/gpt-oss-20b",
             temperature=0.7,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": payload.text}
+            ]
         )
-
-        return {
-            "status": "success", 
-            "sanitized_text": response.choices[0].message.content
-        }
-
+        
+        return SanitizeResponse(
+            original_text=payload.text,
+            sanitised_text=response.choices[0].message.content.strip(),
+            status="success"
+        )
     except Exception as e:
-        # Passes the exact Groq error back to RapidAPI response
-        raise HTTPException(
-            status_code=500, 
-            detail=f"GROQ FAILURE: {type(e).__name__} - {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=str(e))
